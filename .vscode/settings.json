@@ -3,7 +3,7 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.port": "detect",
+  "idf.port": "/dev/tty.usbserial-110",
   "idf.currentSetup": "/Users/kennitohernandez/.espressif/v5.5.2/esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
@@ -13,5 +13,6 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=/Users/kennitohernandez/Documents/GitHub/Synth/build"
-  ]
+  ],
+  "idf.flashType": "UART"
 }
