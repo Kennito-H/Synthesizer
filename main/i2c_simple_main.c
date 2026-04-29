@@ -1,18 +1,23 @@
 #include <stdio.h>
+#include <math.h>
 #include "driver/i2c.h"
 #include "mpu6050.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include <time.h> 
+#include <time.h>
 
 #define I2C_MASTER_SCL_IO 19      /*!< gpio number for I2C master clock */
 #define I2C_MASTER_SDA_IO 18      /*!< gpio number for I2C master data  */
 #define I2C_MASTER_NUM I2C_NUM_0  /*!< I2C port number for master dev */
 #define I2C_MASTER_FREQ_HZ 100000 /*!< I2C master clock frequency */
 
-static const char *TAG = "mpu6050 test";
+#define SAMPLE_PERIOD_MS 20
+#define COMP_ALPHA 0.98f          // gyro weight; (1 - alpha) is accel weight
+#define RAD_TO_DEG (180.0f / (float)M_PI)
+
+static const char *TAG = "airsynth_left";
 static mpu6050_handle_t mpu6050 = NULL;
 
 /**
@@ -71,54 +76,52 @@ static void i2c_sensor_mpu6050_init(void)
 
 void app_main()
 {
-    esp_err_t ret;
-    uint8_t mpu6050_deviceid;
     mpu6050_acce_value_t acce;
     mpu6050_gyro_value_t gyro;
-    mpu6050_temp_value_t temp;
-
 
     i2c_sensor_mpu6050_init();
+
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     double t_start = ts.tv_sec + ts.tv_nsec / 1e9;
+    double t_prev = t_start;
 
-    while(1){
-//       Retrieving the device, acceleration, gyro, temp, and the time
-        ret = mpu6050_get_deviceid(mpu6050, &mpu6050_deviceid);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to get MPU6050 device ID");
-        }
+    // Complementary Filter set up
+    float pitch = 0.0f, roll = 0.0f, yaw = 0.0f;
+    bool seeded = false;
 
-        ret = mpu6050_get_acce(mpu6050, &acce);
-        if (ret != ESP_OK) {
+    while (1) {
+        if (mpu6050_get_acce(mpu6050, &acce) != ESP_OK) {
             ESP_LOGE(TAG, "Failed to get accelerometer data");
         }
-
-        ret = mpu6050_get_gyro(mpu6050, &gyro);
-        if (ret != ESP_OK) {                              
-            ESP_LOGE(TAG, "Failed to get gyro data");   
-        }      
-
-        ret = mpu6050_get_temp(mpu6050, &temp);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to get temperature data");
+        if (mpu6050_get_gyro(mpu6050, &gyro) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to get gyro data");
         }
 
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        double timestamp = (ts.tv_sec + ts.tv_nsec / 1e9) - t_start;
-// ===============================================================================================
+        double now = ts.tv_sec + ts.tv_nsec / 1e9;
+        float dt = (float)(now - t_prev);
+        t_prev = now;
 
-        // Collect 4 seconds of data
+        // Tilt from gravity vector. Stable but noisy.
+        float accel_pitch = atan2f(acce.acce_x,
+                                   sqrtf(acce.acce_y * acce.acce_y +
+                                         acce.acce_z * acce.acce_z)) * RAD_TO_DEG;
+        float accel_roll  = atan2f(acce.acce_y, acce.acce_z) * RAD_TO_DEG;
 
-        printf("%.6f %.3f %.3f %.3f %.3f %.3f %.3f\n",timestamp,acce.acce_x, acce.acce_y, acce.acce_z,
-            gyro.gyro_x, gyro.gyro_y, gyro.gyro_z);
+        if (!seeded) {
+            pitch = accel_pitch;
+            roll  = accel_roll;
+            seeded = true;
+        } else {
+            pitch = COMP_ALPHA * (pitch + gyro.gyro_y * dt) + (1.0f - COMP_ALPHA) * accel_pitch;
+            roll  = COMP_ALPHA * (roll  + gyro.gyro_x * dt) + (1.0f - COMP_ALPHA) * accel_roll;
+        }
+        yaw += gyro.gyro_z * dt;
 
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    mpu6050_delete(mpu6050);
-    ret = i2c_driver_delete(I2C_MASTER_NUM);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to delete I2C driver");
+        double timestamp = now - t_start;
+        printf("%.6f %.2f %.2f %.2f\n", timestamp, pitch, roll, yaw);
+
+        vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
     }
 }
