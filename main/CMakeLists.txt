@@ -1,3 +1,9 @@
-idf_component_register(SRCS "main.c" "sensors.c" "oscillator.c" "arpeggiator.c"
+idf_component_register(SRCS "main.cpp"
+                            "left_hand.cpp"
+                            "left_hand_imu.cpp"
+                            "right_hand.cpp"
+                            "midi_engine.cpp"
+                            "menu_system.cpp"
+                            "arpeggiator.cpp"
                        INCLUDE_DIRS "."
-                       REQUIRES driver)
+                       REQUIRES driver esp_adc esp_timer)
