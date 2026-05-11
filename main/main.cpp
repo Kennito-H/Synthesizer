@@ -43,7 +43,7 @@ static void control_task(void *pvParameters) {
         left_hand_process();
         left_hand_imu_process();
         right_hand_process();
-        
+
         menu_system_process();
 
         vTaskDelay(pdMS_TO_TICKS(10)); // 100Hz

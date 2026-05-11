@@ -24,6 +24,7 @@ static const char *TAG = "right_hand";
 static mpu6050_handle_t mpu6050 = NULL;
 
 static float pitch = 0.0f, roll = 0.0f, yaw = 0.0f;
+static float pitch_offset = 0.0f, roll_offset = 0.0f;
 static float grav_x = 0.0f, grav_y = 0.0f, grav_z = 0.0f;
 static float gyro_bx = 0.0f, gyro_by = 0.0f, gyro_bz = 0.0f;
 static bool seeded = false;
@@ -75,6 +76,14 @@ void right_hand_init(void) {
 
     gyro_calibrate();
 
+  
+    mpu6050_acce_value_t acce_zero;
+    if (mpu6050_get_acce(mpu6050, &acce_zero) == ESP_OK) {
+        pitch_offset = -atan2f(acce_zero.acce_x, acce_zero.acce_z) * RAD_TO_DEG;
+        roll_offset  =  atan2f(acce_zero.acce_y, acce_zero.acce_z) * RAD_TO_DEG;
+        ESP_LOGI(TAG, "Right hand zero: pitch_offset=%.1f roll_offset=%.1f", pitch_offset, roll_offset);
+    }
+
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     t_prev = ts.tv_sec + ts.tv_nsec / 1e9;
@@ -109,8 +118,9 @@ void right_hand_process(void) {
         grav_z = GRAV_BETA * grav_z + (1.0f - GRAV_BETA) * acce.acce_z;
     }
 
-    float accel_pitch = atan2f(grav_x, sqrtf(grav_y * grav_y + grav_z * grav_z)) * RAD_TO_DEG;
-    float accel_roll  = atan2f(grav_y, grav_z) * RAD_TO_DEG;
+  
+    float accel_pitch = -atan2f(grav_x, grav_z) * RAD_TO_DEG;
+    float accel_roll  =  atan2f(grav_y, grav_z) * RAD_TO_DEG;
 
     if (!seeded) {
         pitch = accel_pitch;
@@ -118,7 +128,7 @@ void right_hand_process(void) {
         seeded = true;
     } else {
         pitch = COMP_ALPHA * (pitch + gy * dt) + (1.0f - COMP_ALPHA) * accel_pitch;
-        roll  = COMP_ALPHA * (roll  + gx * dt) + (1.0f - COMP_ALPHA) * accel_roll;
+        roll  = COMP_ALPHA * (roll  - gx * dt) + (1.0f - COMP_ALPHA) * accel_roll;
     }
     yaw += gz * dt;
 }
@@ -127,18 +137,16 @@ float right_hand_get_pitch(void) { return pitch; }
 float right_hand_get_roll(void)  { return roll; }
 float right_hand_get_yaw(void)   { return yaw; }
 
-// Normalize values to [0.0, 1.0] for modulation.
-// Let's assume hand pitch typically ranges from -45 to +45.
+
 float right_hand_get_normalized_y(void) {
-    float y = (pitch + 45.0f) / 90.0f;
+    float y = (pitch - pitch_offset) / 45.0f;
     if (y < 0.0f) y = 0.0f;
     if (y > 1.0f) y = 1.0f;
     return y;
 }
 
-// Let's assume hand roll typically ranges from -45 to +45.
 float right_hand_get_normalized_x(void) {
-    float x = (roll + 45.0f) / 90.0f;
+    float x = ((roll - roll_offset) + 45.0f) / 90.0f;
     if (x < 0.0f) x = 0.0f;
     if (x > 1.0f) x = 1.0f;
     return x;

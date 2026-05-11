@@ -1,14 +1,16 @@
 #include "arpeggiator.h"
-#include <stdlib.h> // for rand()
+#include <stdlib.h>
+#include "esp_random.h"
 
 void arp_init(arpeggiator_t *arp) {
+    srand(esp_random());
     arp->enabled = false;
     arp->mode = ARP_MODE_UP;
     arp->num_octaves = 1;
     arp->base_speed_ms = 125; // 120BPM 16th notes roughly
     arp->speed_multiplier = 1.0f;
     arp->probability = 1.0f;
-    arp->current_step = 0;
+    arp->current_step = -1; // -1 so first UP increment lands on index 0
     arp->ping_pong_down = false;
     arp->last_tick = xTaskGetTickCount();
     arp->is_playing_note = false;

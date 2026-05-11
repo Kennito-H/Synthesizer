@@ -33,10 +33,14 @@ void menu_system_init(void) {
 
 static void handle_keyboard_mode(void) {
     const uint8_t* notes = tuning_get_scale(current_scale);
+    static uint32_t last_trigger_ms[NUM_FINGERS] = {0};
+    static const uint32_t NOTE_RETRIGGER_MS = 80;
+    uint32_t now_kb = pdTICKS_TO_MS(xTaskGetTickCount());
 
     // Read right hand for modulation
     float rx = right_hand_get_normalized_x();
     float ry = right_hand_get_normalized_y();
+
 
     switch (active_mod_assign) {
         case MOD_ASSIGN_FILTER:
@@ -90,7 +94,7 @@ static void handle_keyboard_mode(void) {
 
     // Pass keys to midi engine or arpeggiator
     bool active[NUM_FINGERS];
-    bool chord_changed = false;
+    static int active_voice = -1;
     int xpose = left_hand_imu_get_transpose(); // semitones
 
     for (int i = 0; i < NUM_FINGERS; i++) {
@@ -98,20 +102,25 @@ static void handle_keyboard_mode(void) {
 
         if (!global_arp.enabled) {
             if (left_hand_just_pressed((finger_t)i)) {
+                if (now_kb - last_trigger_ms[i] < NOTE_RETRIGGER_MS) { break; }
+                last_trigger_ms[i] = now_kb;
+                if (active_voice >= 0) midi_engine_note_off(0);
                 uint8_t note_val = notes[i] + xpose;
-                if(note_val > 127) note_val = 127;
-                midi_engine_note_on(i, note_val);
-                chord_changed = true;
-            } else if (left_hand_just_released((finger_t)i)) {
-                // Since we are no longer polyphonic, hold mode only applies to arpeggiator
-                midi_engine_note_off(i);
-                chord_changed = true;
+                if (note_val > 127) note_val = 127;
+                midi_engine_note_on(0, note_val);
+                active_voice = i;
+                ESP_LOGI(TAG, "Key ON: finger=%d note=%d (xpose=%+d)", i, note_val, xpose);
+                break; // one press per tick — prevent same-frame chatter
             }
         }
     }
 
-    if (chord_changed && current_state == STATE_KEYBOARD) {
-        ESP_LOGI(TAG, "Notes updated");
+    // Level-triggered note-off: fires every frame until finger reads low.
+    // More reliable than just_released for noisy/slow-releasing FSR sensors.
+    if (!global_arp.enabled && active_voice >= 0 && !left_hand_is_pressed((finger_t)active_voice)) {
+        midi_engine_note_off(0);
+        ESP_LOGI(TAG, "Key OFF: finger=%d", active_voice);
+        active_voice = -1;
     }
 
     if (global_arp.enabled) {
@@ -139,8 +148,6 @@ static uint32_t last_finger_press_time[NUM_FINGERS] = {0};
 static int max_fingers_held = 0;
 
 bool menu_system_process(void) {
-    gesture_t gesture = left_hand_consume_gesture();
-
     uint32_t now = pdTICKS_TO_MS(xTaskGetTickCount());
     
     int current_fingers = 0;
@@ -168,57 +175,69 @@ bool menu_system_process(void) {
     bool is_double_tap[NUM_FINGERS] = {false};
     for (int i=0; i<NUM_FINGERS; i++) {
         if (pure_single_tap[i]) {
-            if (now - last_finger_press_time[i] < 500) {
+            if (now - last_finger_press_time[i] < 300) {
                 any_double_tap = true;
                 is_double_tap[i] = true;
-                last_finger_press_time[i] = 0; // Reset after detecting
+                pure_single_tap[i] = false; // consumed by double-tap, prevent single-tap also firing
+                last_finger_press_time[i] = 0;
             } else {
                 last_finger_press_time[i] = now;
             }
         }
     }
 
-    // GESTURE_ALL_DOUBLE_TAP: toggle between keyboard and main menu.
-    // GESTURE_ALL_TAP (single): go back one level from any sub-menu.
-    if (gesture == GESTURE_ALL_DOUBLE_TAP) {
-        if (current_state == STATE_KEYBOARD) {
-            ESP_LOGI(TAG, "Entering Main Menu");
+    // Thumb double-tap: toggle arp (in arp submenu) or force-quit menu from any depth.
+    // Menu ENTRY requires holding a non-thumb finger + double-tapping thumb (see below).
+    if (is_double_tap[FINGER_THUMB]) {
+        if (current_state == STATE_SUBMENU_ARP_ROOT) {
+            arp_was_enabled_before_preview = !arp_was_enabled_before_preview;
+            global_arp.enabled = arp_was_enabled_before_preview;
+            ESP_LOGI(TAG, "Arp toggled: %s. Returning to Main Menu.", global_arp.enabled ? "ON" : "OFF");
             current_state = STATE_MAIN_MENU;
-            for(int i=0; i<NUM_VOICES; i++) midi_engine_note_off(i);
-        } else {
-            // Force-quit menu entirely from any depth, restoring arp state.
-            if (current_state == STATE_SUBMENU_ENV || current_state == STATE_SUBMENU_ARP_ROOT || current_state == STATE_SUBMENU_ARP_MODE || current_state == STATE_SUBMENU_ARP_OCTAVE || current_state == STATE_SUBMENU_ARP_SPEED) {
-                global_arp.enabled = arp_was_enabled_before_preview;
-            }
-            if (scale_preview_active) {
-                scale_preview_active = false;
-                global_arp.enabled = scale_preview_arp_saved;
-            }
-            ESP_LOGI(TAG, "Exiting Menu -> Keyboard");
-            current_state = STATE_KEYBOARD;
-            for(int i=0; i<NUM_VOICES; i++) midi_engine_note_off(i);
-        }
-    } else if (gesture == GESTURE_ALL_TAP) {
-        if (current_state == STATE_MAIN_MENU) {
-            ESP_LOGI(TAG, "Exiting Menu -> Keyboard");
-            current_state = STATE_KEYBOARD;
-            for(int i=0; i<NUM_VOICES; i++) midi_engine_note_off(i);
+            for (int i = 0; i < NUM_VOICES; i++) midi_engine_note_off(i);
         } else if (current_state != STATE_KEYBOARD) {
-            // Restore arp state when leaving a preview sub-menu.
-            if (current_state == STATE_SUBMENU_ENV || current_state == STATE_SUBMENU_ARP_ROOT || current_state == STATE_SUBMENU_ARP_MODE || current_state == STATE_SUBMENU_ARP_OCTAVE || current_state == STATE_SUBMENU_ARP_SPEED) {
+            // Force-quit menu entirely from any depth, restoring arp state.
+            if (current_state == STATE_SUBMENU_ENV || current_state == STATE_SUBMENU_ARP_MODE || current_state == STATE_SUBMENU_ARP_OCTAVE || current_state == STATE_SUBMENU_ARP_SPEED) {
                 global_arp.enabled = arp_was_enabled_before_preview;
             }
             if (scale_preview_active) {
                 scale_preview_active = false;
                 global_arp.enabled = scale_preview_arp_saved;
             }
-            ESP_LOGI(TAG, "Back to Main Menu");
-            current_state = STATE_MAIN_MENU;
-            for(int i=0; i<NUM_VOICES; i++) midi_engine_note_off(i);
+            ESP_LOGI(TAG, "Exiting Menu -> Keyboard");
+            current_state = STATE_KEYBOARD;
+            for (int i = 0; i < NUM_VOICES; i++) midi_engine_note_off(i);
         }
     }
 
+    // Menu entry: hold any non-thumb finger + double-tap thumb.
+    // Intentional safety gate — prevents accidental entry during play.
     if (current_state == STATE_KEYBOARD) {
+        static int menu_entry_taps = 0;
+        static uint32_t menu_entry_tap_time = 0;
+
+        bool any_non_thumb_held = false;
+        for (int i = FINGER_PINKIE; i < FINGER_THUMB; i++) {
+            if (left_hand_is_pressed((finger_t)i)) { any_non_thumb_held = true; break; }
+        }
+        if (!any_non_thumb_held) {
+            menu_entry_taps = 0;
+        } else if (left_hand_just_pressed(FINGER_THUMB)) {
+            if (now - menu_entry_tap_time < 300) {
+                menu_entry_taps++;
+            } else {
+                menu_entry_taps = 1;
+            }
+            menu_entry_tap_time = now;
+        }
+        if (menu_entry_taps >= 2) {
+            menu_entry_taps = 0;
+            ESP_LOGI(TAG, "Entering Main Menu");
+            current_state = STATE_MAIN_MENU;
+            for (int i = 0; i < NUM_VOICES; i++) midi_engine_note_off(i);
+            return true;
+        }
+
         handle_keyboard_mode();
         return false;
     }
@@ -238,14 +257,14 @@ bool menu_system_process(void) {
             ESP_LOGI(TAG, "Entered Menu: Arpeggiator Root");
         }
         else if (pure_single_tap[FINGER_MIDDLE]) {
-            current_state = STATE_SUBMENU_TUNING;
-            ESP_LOGI(TAG, "Entered Menu: Scale Tuning");
-        }
-        else if (pure_single_tap[FINGER_POINTER]) {
             current_state = STATE_SUBMENU_ENV;
             arp_was_enabled_before_preview = global_arp.enabled;
             global_arp.enabled = true;
             ESP_LOGI(TAG, "Entered Menu: Envelope Shaping (Move right hand)");
+        }
+        else if (pure_single_tap[FINGER_POINTER]) {
+            current_state = STATE_SUBMENU_TUNING;
+            ESP_LOGI(TAG, "Entered Menu: Scale Tuning");
         }
         else if (pure_single_tap[FINGER_THUMB]) {
             current_state = STATE_SUBMENU_MOD;
@@ -267,7 +286,7 @@ bool menu_system_process(void) {
     else if (current_state == STATE_SUBMENU_ARP_ROOT) {
         if (pure_single_tap[FINGER_PINKIE])   { current_state = STATE_SUBMENU_ARP_MODE;   ESP_LOGI(TAG, "Entered Arp Submenu: Mode"); }
         if (pure_single_tap[FINGER_RING])     { current_state = STATE_SUBMENU_ARP_OCTAVE; ESP_LOGI(TAG, "Entered Arp Submenu: Octave Range"); }
-        if (pure_single_tap[FINGER_MIDDLE])   { current_state = STATE_SUBMENU_ARP_SPEED;  ESP_LOGI(TAG, "Entered Arp Submenu: Speed"); }
+        if (pure_single_tap[FINGER_POINTER])  { current_state = STATE_SUBMENU_ARP_SPEED;  ESP_LOGI(TAG, "Entered Arp Submenu: Speed"); }
         
         if (pure_single_tap[FINGER_THUMB]) {
             ESP_LOGI(TAG, "Double tap thumb to toggle Arp ON/OFF and save.");
@@ -276,21 +295,17 @@ bool menu_system_process(void) {
         bool active[NUM_FINGERS] = {true, true, true, true, true};
         const uint8_t* notes = tuning_get_scale(current_scale);
         uint8_t note = arp_process(&global_arp, notes, active, NUM_FINGERS);
-        if (note > 0) { midi_engine_note_off(0); midi_engine_note_on(0, note); }
+        if (note > 0 && global_arp.current_step != last_arp_step) {
+            last_arp_step = global_arp.current_step;
+            midi_engine_note_off(0);
+            midi_engine_note_on(0, note);
+        }
 
-        if (any_double_tap) {
-            if (is_double_tap[FINGER_THUMB]) {
-                arp_was_enabled_before_preview = !arp_was_enabled_before_preview;
-                ESP_LOGI(TAG, "Arp Toggled! Returning to Main Menu.");
-                global_arp.enabled = arp_was_enabled_before_preview;
-                current_state = STATE_MAIN_MENU;
-                for(int i=0; i<NUM_VOICES; i++) midi_engine_note_off(i);
-            } else if (!is_double_tap[FINGER_PINKIE] && !is_double_tap[FINGER_RING] && !is_double_tap[FINGER_MIDDLE]) {
-                ESP_LOGI(TAG, "Confirmed Arp Settings. Returning to Main Menu.");
-                global_arp.enabled = arp_was_enabled_before_preview;
-                current_state = STATE_MAIN_MENU;
-                for(int i=0; i<NUM_VOICES; i++) midi_engine_note_off(i);
-            }
+        if (any_double_tap && !is_double_tap[FINGER_THUMB]) {
+            ESP_LOGI(TAG, "Confirmed Arp Settings. Returning to Main Menu.");
+            global_arp.enabled = arp_was_enabled_before_preview;
+            current_state = STATE_MAIN_MENU;
+            for (int i = 0; i < NUM_VOICES; i++) midi_engine_note_off(i);
         }
     }
     else if (current_state == STATE_SUBMENU_ARP_MODE) {
@@ -298,6 +313,7 @@ bool menu_system_process(void) {
         if (pure_single_tap[FINGER_RING])     { global_arp.mode = ARP_MODE_DOWN;           ESP_LOGI(TAG, "Selected Arp Mode: Down"); }
         if (pure_single_tap[FINGER_MIDDLE])   { global_arp.mode = ARP_MODE_PING_PONG;      ESP_LOGI(TAG, "Selected Arp Mode: Ping-Pong"); }
         if (pure_single_tap[FINGER_POINTER])  { global_arp.mode = ARP_MODE_RANDOM;         ESP_LOGI(TAG, "Selected Arp Mode: Random"); }
+        if (pure_single_tap[FINGER_THUMB])    { global_arp.mode = ARP_MODE_UP_DOWN_REPEAT; ESP_LOGI(TAG, "Selected Arp Mode: Up-Down Repeat"); }
 
         bool active[NUM_FINGERS] = {true, true, true, true, true};
         const uint8_t* notes = tuning_get_scale(current_scale);
@@ -317,8 +333,8 @@ bool menu_system_process(void) {
     else if (current_state == STATE_SUBMENU_ARP_OCTAVE) {
         if (pure_single_tap[FINGER_PINKIE])   { global_arp.num_octaves = 1; ESP_LOGI(TAG, "Selected Arp Octaves: 1"); }
         if (pure_single_tap[FINGER_RING])     { global_arp.num_octaves = 2; ESP_LOGI(TAG, "Selected Arp Octaves: 2"); }
-        if (pure_single_tap[FINGER_MIDDLE])   { global_arp.num_octaves = 3; ESP_LOGI(TAG, "Selected Arp Octaves: 3"); }
-        if (pure_single_tap[FINGER_POINTER])  { global_arp.num_octaves = 4; ESP_LOGI(TAG, "Selected Arp Octaves: 4"); }
+        if (pure_single_tap[FINGER_POINTER])  { global_arp.num_octaves = 3; ESP_LOGI(TAG, "Selected Arp Octaves: 3"); }
+        if (pure_single_tap[FINGER_THUMB])    { global_arp.num_octaves = 4; ESP_LOGI(TAG, "Selected Arp Octaves: 4"); }
 
         bool active[NUM_FINGERS] = {true, true, true, true, true};
         const uint8_t* notes = tuning_get_scale(current_scale);
@@ -381,7 +397,7 @@ bool menu_system_process(void) {
             scale_preview_end_tick  = xTaskGetTickCount() + pdMS_TO_TICKS(SCALE_PREVIEW_MS);
             global_arp.enabled      = true;
             global_arp.mode         = ARP_MODE_UP;
-            global_arp.current_step = 0;
+            global_arp.current_step = -1;
         }
 
         // Drive arp preview while active so the user hears the ascending scale
@@ -407,8 +423,16 @@ bool menu_system_process(void) {
         // Envelope shaping live preview
         float rx = right_hand_get_normalized_x(); // Decay
         float ry = right_hand_get_normalized_y(); // Attack
-        midi_engine_cc(80, (uint8_t)(rx * 127)); // Amp Decay
-        midi_engine_cc(79, (uint8_t)(ry * 127)); // Amp Attack
+        midi_engine_cc(81, (uint8_t)(rx * 127)); // Amp Decay Time (CC 81)
+        midi_engine_cc(79, (uint8_t)(ry * 127)); // Amp Attack Time (CC 79)
+
+        static TickType_t last_env_log = 0;
+        TickType_t now_env = xTaskGetTickCount();
+        if ((now_env - last_env_log) * portTICK_PERIOD_MS >= 500) {
+            last_env_log = now_env;
+            ESP_LOGI(TAG, "[ENV] attack:%d decay:%d  (pitch=%.2f roll=%.2f)",
+                     (int)(ry * 127), (int)(rx * 127), ry, rx);
+        }
         
         // Arp is running in background because we enabled it when entering
         bool active[NUM_FINGERS] = {true, false, true, false, true}; // Fake chord

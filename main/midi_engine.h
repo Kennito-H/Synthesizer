@@ -1,23 +1,13 @@
 #pragma once
 #include <stdint.h>
 
-/*
- * MIDI Out Wiring (3.3V Logic for ESP32)
- * 
- * Using a standard 5-pin DIN connector:
- * Pin 2 (Center) -> Ground
- * Pin 4 (Left of center) -> 3.3V via a 33-ohm resistor
- * Pin 5 (Right of center) -> ESP32 GPIO 17 (TX) via a 10-ohm resistor
- * 
- * Note: Looking at the female jack from the front, the pins are:
- * [1]  [4]  [2]  [5]  [3]
- */
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define NUM_VOICES 10
+#define NUM_VOICES    10
+#define MIDI_CHANNEL  1    // Syntakt track 1
+#define NOTE_VELOCITY 127
 
 void midi_engine_init(void);
 void midi_engine_note_on(int voice_index, uint8_t note);

@@ -5,5 +5,6 @@ idf_component_register(SRCS "main.cpp"
                             "midi_engine.cpp"
                             "menu_system.cpp"
                             "arpeggiator.cpp"
+                            "tuning.cpp"
                        INCLUDE_DIRS "."
                        REQUIRES driver esp_adc esp_timer)
